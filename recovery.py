@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Security-Automation Repository Automated Recovery Script
+Version: 2.0
 Purpose: Restore repository from backups with safety checks and automation
+Features: Selective restore, rollback, versioning, scheduling
 """
 
 import os
@@ -17,6 +19,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 import requests
+
+__version__ = "2.0.0"
+__author__ = "Security-Automation Team"
+__license__ = "MIT"
 
 
 class RecoveryConfig:
@@ -63,13 +69,38 @@ class RecoveryConfig:
         """Save configuration to file"""
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.config_file, 'w') as f:
-            json.dump(f, f, indent=2)
+            json.dump(self.config, f, indent=2)
     
     def get(self, key: str, default=None):
         return self.config.get(key, default)
     
     def __getitem__(self, key):
         return self.config[key]
+
+
+class BackupVersionInfo:
+    """Read version information from backup"""
+    
+    @staticmethod
+    def get_version_info(backup_dir: Path) -> Optional[dict]:
+        """Extract version information from backup manifest"""
+        manifest = backup_dir / 'MANIFEST.md'
+        if not manifest.exists():
+            return None
+        
+        try:
+            content = manifest.read_text()
+            info = {}
+            for line in content.split('\n'):
+                if '**' in line and ':' in line:
+                    parts = line.split(':', 1)
+                    if len(parts) == 2:
+                        key = parts[0].replace('**', '').replace('-', '').strip().lower()
+                        value = parts[1].strip()
+                        info[key] = value
+            return info if info else None
+        except:
+            return None
 
 
 class RecoveryLogger:
@@ -81,6 +112,9 @@ class RecoveryLogger:
         
         self.logger = logging.getLogger('recovery')
         self.logger.setLevel(logging.DEBUG)
+        
+        # Clear existing handlers
+        self.logger.handlers = []
         
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.DEBUG)
@@ -145,8 +179,8 @@ class RecoveryManager:
             self.lock_file.unlink()
     
     def list_backups(self) -> List[Path]:
-        """List available backups"""
-        logger.info("Available backups:")
+        """List available backups with version info"""
+        logger.info(f"Available backups (Recovery v{__version__}):")
         
         if not self.backup_base_dir.exists():
             logger.error(f"Backup directory not found: {self.backup_base_dir}")
@@ -166,17 +200,23 @@ class RecoveryManager:
         for i, backup_dir in enumerate(backups, 1):
             size = self._format_size(self._get_dir_size(backup_dir))
             mtime = datetime.fromtimestamp(backup_dir.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            version_info = BackupVersionInfo.get_version_info(backup_dir)
             
             print(f"\033[34m[{i}]\033[0m {backup_dir.name}")
             print(f"    Size: {size}")
             print(f"    Date: {mtime}")
             
+            if version_info:
+                print(f"    Script Version: {version_info.get('script version', 'N/A')}")
+                print(f"    Git Branch: {version_info.get('git branch', 'N/A')}")
+                print(f"    Git Commit: {version_info.get('git commit', 'N/A')[:8]}...")
+            
             if (backup_dir / 'MANIFEST.md').exists():
-                print(f"    \u2713 Manifest")
+                print(f"    ✓ Manifest")
             if list(backup_dir.glob('repository/repo_files_*.tar.gz')):
-                print(f"    \u2713 Repository Files")
+                print(f"    ✓ Repository Files")
             if (backup_dir / 'metadata' / 'repo.bundle').exists():
-                print(f"    \u2713 Git Bundle")
+                print(f"    ✓ Git Bundle")
             print("")
         
         return backups
@@ -381,10 +421,14 @@ class RecoveryManager:
         if restore_dir is None:
             restore_dir = Path.cwd()
         
+        version_info = BackupVersionInfo.get_version_info(backup_dir)
+        
         logger.info("="*42)
-        logger.info("Starting Full Restoration")
+        logger.info(f"Recovery v{__version__}")
         logger.info("="*42)
         logger.info(f"Backup: {backup_dir.name}")
+        if version_info:
+            logger.info(f"Backup Script Version: {version_info.get('script version', 'N/A')}")
         logger.info(f"Restore to: {restore_dir}")
         print("")
         
@@ -502,6 +546,7 @@ def main():
     parser.add_argument('--remove-schedule', action='store_true', help='Remove cron scheduling')
     parser.add_argument('--configure', action='store_true', help='Edit configuration')
     parser.add_argument('--restore-dir', default='.', help='Directory to restore to')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     
     args = parser.parse_args()
     

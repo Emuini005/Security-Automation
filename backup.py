@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Security-Automation Repository Automated Backup Script
+Version: 2.0
 Purpose: Create complete backups with scheduling, notification, and automation
-Features: Cron scheduling, email alerts, cloud sync, retention policies
+Features: Cron scheduling, email alerts, cloud sync, retention policies, versioning
 """
 
 import os
@@ -12,16 +13,19 @@ import shutil
 import tarfile
 import hashlib
 import subprocess
-import threading
 import argparse
 import smtplib
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
+
+__version__ = "2.0.0"
+__author__ = "Security-Automation Team"
+__license__ = "MIT"
 
 
 class BackupConfig:
@@ -57,6 +61,8 @@ class BackupConfig:
             '*.pyc', '.venv', 'venv', '.env', 'node_modules', '.DS_Store'
         ],
         'enable_audit_log': True,
+        'enable_versioning': True,
+        'max_versions_per_branch': 5,
     }
     
     def __init__(self, config_file: Path):
@@ -92,6 +98,66 @@ class BackupConfig:
         return self.config[key]
 
 
+class BackupVersionManager:
+    """Manage backup versioning and metadata"""
+    
+    def __init__(self, backup_base_dir: Path):
+        self.backup_base_dir = backup_base_dir
+        self.version_file = backup_base_dir / '.backups-version.json'
+        self.versions = self._load_versions()
+    
+    def _load_versions(self) -> Dict:
+        """Load version metadata"""
+        if self.version_file.exists():
+            try:
+                with open(self.version_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load versions: {e}")
+        return {'backups': {}, 'branches': {}}
+    
+    def _save_versions(self):
+        """Save version metadata"""
+        self.version_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.version_file, 'w') as f:
+            json.dump(self.versions, f, indent=2)
+    
+    def register_backup(self, backup_id: str, git_branch: str, git_commit: str, metadata: Dict):
+        """Register a new backup version"""
+        version_info = {
+            'backup_id': backup_id,
+            'timestamp': datetime.now().isoformat(),
+            'git_branch': git_branch,
+            'git_commit': git_commit,
+            'script_version': __version__,
+            'metadata': metadata
+        }
+        
+        self.versions['backups'][backup_id] = version_info
+        
+        if git_branch not in self.versions['branches']:
+            self.versions['branches'][git_branch] = []
+        
+        self.versions['branches'][git_branch].append(backup_id)
+        self._save_versions()
+        
+        logger.success(f"Backup registered: {backup_id} (version {__version__})")
+    
+    def get_backup_version(self, backup_id: str) -> Optional[Dict]:
+        """Get backup version information"""
+        return self.versions['backups'].get(backup_id)
+    
+    def list_versions(self, branch: Optional[str] = None) -> List[str]:
+        """List backup versions"""
+        if branch:
+            return self.versions['branches'].get(branch, [])
+        return list(self.versions['backups'].keys())
+    
+    def get_branch_versions(self) -> Dict[str, List[str]]:
+        """Get all versions organized by branch"""
+        return self.versions['branches']
+
+
 class BackupLogger:
     """Logging management"""
     
@@ -99,19 +165,15 @@ class BackupLogger:
         self.log_file = log_file
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         
-        # Configure logging
         self.logger = logging.getLogger('backup')
         self.logger.setLevel(logging.DEBUG)
         
-        # File handler
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.DEBUG)
         
-        # Console handler
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         
-        # Formatter
         formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
         fh.setFormatter(formatter)
         ch.setFormatter(formatter)
@@ -141,9 +203,40 @@ class BackupManager:
         self.state_dir = backup_base_dir / '.state'
         self.lock_file = self.state_dir / 'backup.lock'
         self.config = config
+        self.version_manager = BackupVersionManager(backup_base_dir)
         self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.backup_dir = backup_base_dir / f'backup_{self.timestamp}'
         self.log_file = self.backup_dir / 'backup.log'
+        self.git_branch = self._get_git_branch()
+        self.git_commit = self._get_git_commit()
+    
+    def _get_git_branch(self) -> str:
+        """Get current git branch"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            return result.stdout.strip() or 'unknown'
+        except:
+            return 'unknown'
+    
+    def _get_git_commit(self) -> str:
+        """Get current git commit"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            return result.stdout.strip() or 'unknown'
+        except:
+            return 'unknown'
     
     def acquire_lock(self) -> bool:
         """Acquire process lock"""
@@ -189,7 +282,6 @@ class BackupManager:
             
             with tarfile.open(archive_path, 'w:gz') as tar:
                 for item in self.repo_root.iterdir():
-                    # Skip excluded patterns
                     if any(pattern in str(item) for pattern in self.config['exclude_patterns']):
                         continue
                     tar.add(item, arcname=item.name)
@@ -288,7 +380,7 @@ class BackupManager:
             return False
     
     def create_manifest(self) -> bool:
-        """Create backup manifest"""
+        """Create backup manifest with version info"""
         logger.info("Creating backup manifest...")
         
         try:
@@ -299,8 +391,10 @@ class BackupManager:
 ## Backup Information
 - **Created**: {datetime.now()}
 - **Repository**: https://github.com/Emuini005/Security-Automation
-- **Backup Version**: 2.0 (Automated - Python)
+- **Script Version**: {__version__}
 - **Backup ID**: {self.timestamp}
+- **Git Branch**: {self.git_branch}
+- **Git Commit**: {self.git_commit}
 
 ## Directory Structure
 
@@ -468,6 +562,9 @@ class BackupManager:
             body = f"""{message}
 
 Backup Directory: {self.backup_dir}
+Backup Version: {__version__}
+Git Branch: {self.git_branch}
+Git Commit: {self.git_commit}
 Timestamp: {datetime.now()}
 Status: {status}"""
             
@@ -507,6 +604,16 @@ Status: {status}"""
                             "short": True
                         },
                         {
+                            "title": "Script Version",
+                            "value": __version__,
+                            "short": True
+                        },
+                        {
+                            "title": "Git Branch",
+                            "value": self.git_branch,
+                            "short": True
+                        },
+                        {
                             "title": "Size",
                             "value": self._format_size(self._get_dir_size(self.backup_dir)),
                             "short": True
@@ -528,7 +635,7 @@ Status: {status}"""
     def run_backup(self) -> bool:
         """Execute full backup process"""
         logger.info("="*42)
-        logger.info("Security-Automation Backup Process Started")
+        logger.info(f"Security-Automation Backup v{__version__}")
         logger.info("="*42)
         
         success = True
@@ -546,6 +653,15 @@ Status: {status}"""
             
             self.compress_backup()
             self.cleanup_old_backups()
+            
+            # Register backup version if enabled
+            if self.config['enable_versioning']:
+                self.version_manager.register_backup(
+                    self.timestamp,
+                    self.git_branch,
+                    self.git_commit,
+                    {'size': self._get_dir_size(self.backup_dir)}
+                )
             
             status = "SUCCESS" if success else "FAILURE"
             message = f"Backup completed {'successfully' if success else 'with errors'}. Backup ID: {self.timestamp}"
@@ -650,8 +766,10 @@ def main():
     parser.add_argument('--remove-schedule', action='store_true', help='Remove cron scheduling')
     parser.add_argument('--status', action='store_true', help='Show backup status')
     parser.add_argument('--list', action='store_true', help='List all backups')
+    parser.add_argument('--versions', action='store_true', help='Show backup versions')
     parser.add_argument('--clean', action='store_true', help='Clean old backups')
     parser.add_argument('--configure', action='store_true', help='Edit configuration')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     
     args = parser.parse_args()
     
@@ -695,6 +813,17 @@ def main():
         for backup_dir in backup_dirs:
             size = BackupManager._format_size(BackupManager._get_dir_size(backup_dir))
             logger.info(f"{backup_dir.name} - {size}")
+    
+    elif args.versions:
+        version_manager = BackupVersionManager(backup_base_dir)
+        logger.info(f"Backup Versions (Script v{__version__}):")
+        branches = version_manager.get_branch_versions()
+        for branch, versions in branches.items():
+            logger.info(f"\nBranch: {branch}")
+            for version_id in versions:
+                version_info = version_manager.get_backup_version(version_id)
+                if version_info:
+                    logger.info(f"  - {version_id} (Script v{version_info.get('script_version', 'N/A')})")
     
     elif args.clean:
         manager = BackupManager(script_dir, backup_base_dir, config)
