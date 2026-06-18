@@ -10,21 +10,18 @@ Project Goal:
 
 What this script does:
     - Lists available backups
-    - Restores a selected backup (repository files only)
-    - Verifies backup integrity using SHA256 checksums
+    - Restores a selected backup archive
+    - Verifies backup integrity using SHA256 checksum files
     - Creates a rollback snapshot before restoring
     - Automatically rolls back if restoration fails
     - Logs all actions for audit and troubleshooting
 
-This version is intentionally simplified to:
-    - Match the simplified backup script
-    - Make the logic easy to follow for academic evaluation
-    - Highlight core security automation concepts
+This version uses **pure Python configuration only**.
+No JSON files are created or loaded.
 """
 
 import os
 import sys
-import json
 import tarfile
 import shutil
 import hashlib
@@ -35,7 +32,7 @@ from pathlib import Path
 
 
 # -----------------------------
-# Configuration
+# Configuration (pure Python)
 # -----------------------------
 
 DEFAULT_CONFIG = {
@@ -50,13 +47,6 @@ DEFAULT_CONFIG = {
 # -----------------------------
 
 def setup_logger(log_path: Path) -> logging.Logger:
-    """
-    Configure a logger that writes to both console and file.
-
-    Security relevance:
-        - Provides an audit trail of recovery actions.
-        - Helps diagnose failures and supports incident response.
-    """
     logger = logging.getLogger("recovery")
     logger.setLevel(logging.DEBUG)
 
@@ -80,23 +70,6 @@ def setup_logger(log_path: Path) -> logging.Logger:
 # Utility Functions
 # -----------------------------
 
-def load_config(config_path: Path) -> dict:
-    """
-    Load recovery configuration from JSON file.
-    If missing, create it with defaults.
-
-    This mirrors the backup script's config handling.
-    """
-    if config_path.exists():
-        data = json.loads(config_path.read_text())
-        cfg = DEFAULT_CONFIG.copy()
-        cfg.update(data)
-        return cfg
-    else:
-        config_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
-        return DEFAULT_CONFIG.copy()
-
-
 def compute_sha256(file_path: Path) -> str:
     """Compute SHA256 hash of a file."""
     h = hashlib.sha256()
@@ -106,68 +79,49 @@ def compute_sha256(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def verify_checksum(backup_dir: Path, logger: logging.Logger) -> bool:
+def verify_checksum(archive_path: Path, logger: logging.Logger) -> bool:
     """
-    Verify all files listed in checksums.json.
+    Verify the archive's SHA256 checksum using the .sha256 file
+    created by the backup script.
+    """
+    checksum_path = archive_path.with_suffix(archive_path.suffix + ".sha256")
 
-    Security relevance:
-        - Ensures backup has not been corrupted or tampered with.
-    """
-    checksum_file = backup_dir / "checksums.json"
-    if not checksum_file.exists():
-        logger.warning("No checksum file found; skipping integrity check")
+    if not checksum_path.exists():
+        logger.warning("Checksum file not found; skipping integrity check")
         return True
 
-    checksums = json.loads(checksum_file.read_text())
-    logger.info("Verifying backup integrity...")
+    content = checksum_path.read_text().strip()
+    expected = content.split("  ")[0]
+    actual = compute_sha256(archive_path)
 
-    all_valid = True
-    for rel_path, expected_hash in checksums.items():
-        full_path = backup_dir / rel_path
-        if not full_path.exists():
-            logger.error(f"Missing file: {rel_path}")
-            all_valid = False
-            continue
-
-        actual_hash = compute_sha256(full_path)
-        if actual_hash != expected_hash:
-            logger.error(f"Hash mismatch: {rel_path}")
-            all_valid = False
-
-    if all_valid:
-        logger.info("Integrity check passed")
+    if actual == expected:
+        logger.info("Checksum verification succeeded")
+        return True
     else:
-        logger.error("Integrity check FAILED")
+        logger.error("Checksum verification FAILED")
+        return False
 
-    return all_valid
-
-
-# -----------------------------
-# Recovery Operations
-# -----------------------------
 
 def list_backups(backup_root: Path, logger: logging.Logger):
     """
-    List available backups with size and timestamp.
-
-    This helps the user choose which backup to restore.
+    List available backup archives.
     """
     backups = sorted(
-        backup_root.glob("backup_*"),
+        backup_root.glob("backup_*.tar.gz"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
 
     if not backups:
         logger.error("No backups found")
-        return
+        return []
 
     print("\nAvailable Backups:\n")
     for i, b in enumerate(backups, 1):
-        size = sum(f.stat().st_size for f in b.rglob("*") if f.is_file())
         timestamp = datetime.fromtimestamp(b.stat().st_mtime)
+        size_kb = b.stat().st_size / 1024
         print(f"[{i}] {b.name}")
-        print(f"    Size: {size/1024:.1f} KB")
+        print(f"    Size: {size_kb:.1f} KB")
         print(f"    Date: {timestamp}")
         print("")
 
@@ -175,14 +129,8 @@ def list_backups(backup_root: Path, logger: logging.Logger):
 
 
 def create_rollback_snapshot(target_dir: Path, rollback_dir: Path, logger: logging.Logger):
-    """
-    Create a rollback snapshot of the current project directory.
-
-    Security relevance:
-        - Allows safe rollback if recovery fails.
-    """
+    """Create a rollback snapshot of the current project directory."""
     logger.info("Creating rollback snapshot...")
-
     rollback_dir.mkdir(parents=True, exist_ok=True)
 
     for item in target_dir.iterdir():
@@ -196,22 +144,15 @@ def create_rollback_snapshot(target_dir: Path, rollback_dir: Path, logger: loggi
 
 
 def rollback(target_dir: Path, rollback_dir: Path, logger: logging.Logger):
-    """
-    Restore the rollback snapshot.
-
-    This prevents partial or corrupted restores from leaving the system
-    in an inconsistent state.
-    """
+    """Restore the rollback snapshot."""
     logger.warning("Rolling back to previous state...")
 
-    # Clear target directory
     for item in target_dir.iterdir():
         if item.is_dir():
             shutil.rmtree(item)
         else:
             item.unlink()
 
-    # Restore snapshot
     for item in rollback_dir.iterdir():
         dest = target_dir / item.name
         if item.is_dir():
@@ -222,38 +163,33 @@ def rollback(target_dir: Path, rollback_dir: Path, logger: logging.Logger):
     logger.info("Rollback completed")
 
 
-def restore_backup(backup_dir: Path, target_dir: Path, config: dict, logger: logging.Logger):
+def restore_backup(archive_path: Path, target_dir: Path, config: dict, logger: logging.Logger):
     """
-    Restore repository files from a backup archive.
+    Restore from a backup archive.
 
     Steps:
         1. Verify integrity (optional)
         2. Create rollback snapshot
-        3. Extract backup archive
+        3. Extract archive
         4. Roll back if extraction fails
     """
-    logger.info(f"Restoring from backup: {backup_dir.name}")
+    logger.info(f"Restoring from archive: {archive_path.name}")
 
     # Step 1: Integrity check
     if config["enable_integrity_check"]:
-        if not verify_checksum(backup_dir, logger):
+        if not verify_checksum(archive_path, logger):
             logger.error("Backup integrity failed; aborting restore")
             return False
 
-    # Step 2: Create rollback snapshot
-    rollback_dir = backup_dir / f"rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Step 2: Rollback snapshot
+    rollback_dir = target_dir / f".rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if config["enable_rollback"]:
         create_rollback_snapshot(target_dir, rollback_dir, logger)
 
     # Step 3: Extract archive
-    archive = next(backup_dir.glob("repository/repo_files_*.tar.gz"), None)
-    if not archive:
-        logger.error("Backup archive not found")
-        return False
-
     try:
         logger.info("Extracting backup archive...")
-        with tarfile.open(archive, "r:gz") as tar:
+        with tarfile.open(archive_path, "r:gz") as tar:
             tar.extractall(target_dir)
         logger.info("Restore completed successfully")
         return True
@@ -261,7 +197,6 @@ def restore_backup(backup_dir: Path, target_dir: Path, config: dict, logger: log
     except Exception as e:
         logger.error(f"Restore failed: {e}")
 
-        # Step 4: Roll back
         if config["enable_rollback"]:
             rollback(target_dir, rollback_dir, logger)
 
@@ -275,26 +210,20 @@ def restore_backup(backup_dir: Path, target_dir: Path, config: dict, logger: log
 def parse_args():
     parser = argparse.ArgumentParser(description="Security-Automation Recovery Script")
     parser.add_argument("--list", action="store_true", help="List available backups")
-    parser.add_argument("--restore", type=str, help="Backup ID to restore (or 'latest')")
+    parser.add_argument("--restore", type=str, help="Backup name or 'latest'")
     parser.add_argument("--target", type=str, default=".", help="Directory to restore into")
     return parser.parse_args()
 
 
 def main():
     script_dir = Path(__file__).parent.resolve()
-    config_path = script_dir / "recovery-config.json"
     backup_root = script_dir / DEFAULT_CONFIG["backup_dir"]
     target_dir = Path.cwd()
 
-    # Ensure backup directory exists
     backup_root.mkdir(exist_ok=True)
 
-    # Setup logging
     log_path = backup_root / f"recovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logger = setup_logger(log_path)
-
-    # Load config
-    config = load_config(config_path)
 
     args = parse_args()
 
@@ -308,19 +237,20 @@ def main():
             return
 
         if args.restore == "latest":
-            backup_dir = backups[0]
+            archive_path = backups[0]
         else:
-            backup_dir = backup_root / args.restore
+            archive_path = backup_root / args.restore
 
-        if not backup_dir.exists():
+        if not archive_path.exists():
             logger.error("Backup not found")
             return
 
-        restore_backup(backup_dir, target_dir, config, logger)
+        restore_backup(archive_path, target_dir, DEFAULT_CONFIG, logger)
         return
 
-    print("Use --list or --restore <backup_id>")
+    print("Use --list or --restore <backup_file>")
 
 
 if __name__ == "__main__":
     main()
+
