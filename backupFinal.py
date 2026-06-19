@@ -6,18 +6,18 @@ Security-Automation Backup Script (Simplified Version)
 Course: Security Automation
 Project Goal:
     Demonstrate automation of a security-relevant task (repository backup)
-    with logging, integrity verification, and basic retention.
+    with logging, integrity verification, immutability, and basic retention.
 
 What this script does:
     - Creates timestamped backups of a project directory
     - Excludes unnecessary files (caches, virtualenvs, etc.)
     - Compresses the backup into a .tar.gz archive
     - Generates SHA256 checksums for integrity verification
+    - Applies Linux immutability flags to protect backups
     - Applies a simple retention policy (keep last N backups)
     - Logs all actions to a log file and to the console
 
-This version uses **pure Python configuration only**.
-No JSON files are created or loaded.
+This version uses pure Python configuration only.
 """
 
 import os
@@ -26,6 +26,7 @@ import tarfile
 import hashlib
 import shutil
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import argparse
@@ -47,6 +48,7 @@ DEFAULT_CONFIG = {
         ".DS_Store",
     ],
     "enable_checksums": True,
+    "enable_immutability": True,
 }
 
 # -----------------------------
@@ -148,6 +150,37 @@ def verify_checksum(archive_path: Path, checksum_path: Path, logger) -> bool:
         return False
 
 
+# -----------------------------
+# Immutability Support
+# -----------------------------
+
+def make_immutable(path: Path, logger):
+    """
+    Applies Linux immutable flag (+i) to a file.
+    Prevents modification, deletion, or renaming.
+    """
+    try:
+        subprocess.run(["chattr", "+i", str(path)], check=True)
+        logger.info(f"Immutable flag applied: {path}")
+    except Exception as e:
+        logger.error(f"Failed to apply immutable flag to {path}: {e}")
+
+
+def remove_immutable(path: Path, logger):
+    """
+    Removes immutable flag (-i) so retention can delete old backups.
+    """
+    try:
+        subprocess.run(["chattr", "-i", str(path)], check=False)
+        logger.debug(f"Immutable flag removed: {path}")
+    except Exception as e:
+        logger.error(f"Failed to remove immutable flag: {e}")
+
+
+# -----------------------------
+# Retention Policy
+# -----------------------------
+
 def apply_retention_policy(backup_root: Path, max_backups: int, logger):
     archives = sorted(
         backup_root.glob("backup_*.tar.gz"),
@@ -161,7 +194,12 @@ def apply_retention_policy(backup_root: Path, max_backups: int, logger):
 
     for old in archives[max_backups:]:
         logger.info(f"Deleting old backup: {old.name}")
+
+        # Remove immutability before deletion
+        remove_immutable(old, logger)
         checksum = old.with_suffix(old.suffix + ".sha256")
+        remove_immutable(checksum, logger)
+
         if checksum.exists():
             checksum.unlink()
         old.unlink()
@@ -183,6 +221,10 @@ def run_backup(project_root: Path, config: dict, logger):
     if config["enable_checksums"]:
         checksum_path = write_checksum_file(archive_path, logger)
         verify_checksum(archive_path, checksum_path, logger)
+
+        if config["enable_immutability"]:
+            make_immutable(archive_path, logger)
+            make_immutable(checksum_path, logger)
 
     apply_retention_policy(
         backup_root=backup_root,
